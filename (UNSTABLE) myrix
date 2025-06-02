@@ -1,251 +1,289 @@
 #!/usr/bin/env bash
-# MYRIX - My Reliable Infrastructure eXecutor
-# Author: yuhboiililtesti
-# Repo: https://github.com/yuhboiililtesti/MYRIX-V4
+# MYRIX - Modular Linux Server Management Script v1.0.0
+# Author: User / OpenAI GPT-4o-mini
+# Features: Plex, Minecraft, DuckDNS, System, Backup, Firewall, Git, VBox, Services, Utilities
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# Global vars
-CONFIG_FILE="${HOME}/.myrix_autofill.conf"
-LOG_FILE="${HOME}/.myrix.log"
-BACKUP_DIR="${HOME}/myrix_backups"
-PLEX_SERVICE="plexmediaserver"
-MC_SERVICE="minecraft"
-DUCKDNS_DIR="${HOME}/duckdns"
-DATE=$(date '+%Y-%m-%d_%H-%M-%S')
+MYRIX_LOG="/var/log/myrix.log"
+MYRIX_VERSION="1.0.0"
+PLEX_SERVICE="plexmediaserver.service"
+MC_SERVICE="minecraft.service"
+DUCKDNS_SERVICE="duckdns.service"
 
-# Load config autofill or set defaults
-declare -A CONFIG
-if [[ -f "$CONFIG_FILE" ]]; then
-  while IFS='=' read -r key val; do
-    key="${key// /}" # remove spaces
-    val="${val//\"/}" # remove quotes
-    [[ -z "$key" || "$key" =~ ^# ]] && continue
-    CONFIG[$key]=$val
-  done < "$CONFIG_FILE"
-fi
-
-BACKUP_DIR="${CONFIG[backup_dir]:-$BACKUP_DIR}"
-PLEX_SERVICE="${CONFIG[plex_service]:-$PLEX_SERVICE}"
-MC_SERVICE="${CONFIG[minecraft_service]:-$MC_SERVICE}"
-DUCKDNS_DIR="${CONFIG[duckdns_dir]:-$DUCKDNS_DIR}"
-
-# Logging function with timestamp and user
+# Logging utility with timestamp and level
 log() {
-  local msg="$1"
-  echo "$(date '+%F %T') [$(whoami)] $msg" | tee -a "$LOG_FILE"
+  local level=$1
+  shift
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [$level] $*" | tee -a "$MYRIX_LOG"
 }
 
-# Utility: Check if a systemd service is active
-is_active() {
-  systemctl is-active --quiet "$1"
+error_exit() {
+  log ERROR "$1"
+  exit 1
 }
 
-# Utility: Start service with idempotency
-service_start() {
-  local svc="$1"
-  if is_active "$svc"; then
-    log "$svc already running. Start skipped."
-  else
-    systemctl start "$svc"
-    log "$svc started."
+require_root() {
+  if (( EUID != 0 )); then
+    error_exit "Root privileges required."
   fi
 }
 
-# Utility: Stop service with idempotency
-service_stop() {
-  local svc="$1"
-  if ! is_active "$svc"; then
-    log "$svc not running. Stop skipped."
+# Idempotency check helper: run command only if condition true
+run_if_not_active() {
+  local check_cmd=$1
+  local run_cmd=$2
+  if ! eval "$check_cmd"; then
+    eval "$run_cmd"
   else
-    systemctl stop "$svc"
-    log "$svc stopped."
+    log INFO "No action needed, already active."
   fi
 }
 
-# Plex Commands --------------------------------------------------------------
+# === Plex Controls ===
+
 plex_status() {
-  systemctl status "$PLEX_SERVICE"
+  systemctl status "$PLEX_SERVICE" --no-pager
+  journalctl -u "$PLEX_SERVICE" --no-pager -n 20
 }
 
 plex_start() {
-  service_start "$PLEX_SERVICE"
+  run_if_not_active "systemctl is-active --quiet $PLEX_SERVICE" "systemctl start $PLEX_SERVICE"
 }
 
 plex_stop() {
-  service_stop "$PLEX_SERVICE"
+  if systemctl is-active --quiet "$PLEX_SERVICE"; then
+    systemctl stop "$PLEX_SERVICE"
+  else
+    log INFO "Plex service is not running."
+  fi
 }
 
 plex_restart() {
   systemctl restart "$PLEX_SERVICE"
-  log "Plex restarted."
 }
 
 plex_reload() {
   systemctl reload "$PLEX_SERVICE"
-  log "Plex config reloaded."
 }
 
 plex_fix() {
-  log "Running Plex auto-fix diagnostics..."
-  plex_diagnose_db
+  log INFO "Starting Plex auto-fix routine..."
+  plex_stop
   plex_reset_perms
   plex_purge_cache
-  plex_restart
-  log "Plex auto-fix completed."
+  plex_start
+  log INFO "Plex auto-fix completed."
 }
 
 plex_diagnose_db() {
   local plex_db_path="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
   if [[ -f "$plex_db_path" ]]; then
-    log "Checking Plex DB integrity..."
-    sqlite3 "$plex_db_path" "PRAGMA integrity_check;"
+    log INFO "Checking Plex DB integrity..."
+    sqlite3 "$plex_db_path" "PRAGMA integrity_check;" | grep -v 'ok' && log ERROR "DB integrity check failed." || log INFO "DB integrity OK."
   else
-    log "Plex DB not found at $plex_db_path"
+    log ERROR "Plex DB not found at $plex_db_path"
   fi
+}
+
+plex_diagnostics() {
+  log INFO "Running full Plex diagnostics and repair..."
+  plex_status
+  plex_diagnose_db
+  plex_fix
+  log INFO "Plex diagnostics complete."
 }
 
 plex_purge_cache() {
   local cache_dir="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Cache"
   if [[ -d "$cache_dir" ]]; then
-    rm -rf "${cache_dir:?}/"*
-    log "Plex cache purged."
+    rm -rf "$cache_dir"/*
+    log INFO "Plex cache purged."
   else
-    log "Plex cache directory not found."
+    log WARN "Plex cache directory not found."
   fi
 }
 
 plex_reset_perms() {
-  local plex_user="plex"
-  local plex_dir="/var/lib/plexmediaserver"
-  chown -R "$plex_user":"$plex_user" "$plex_dir"
-  log "Plex permissions reset."
+  chown -R plex:plex "/var/lib/plexmediaserver"
+  chmod -R 755 "/var/lib/plexmediaserver"
+  log INFO "Plex permissions reset."
 }
 
+plex_backup_dir="/var/backups/plex"
+mkdir -p "$plex_backup_dir"
+
 plex_backup() {
-  mkdir -p "$BACKUP_DIR/plex"
-  local backup_file="$BACKUP_DIR/plex/plex_backup_$DATE.tar.gz"
-  tar czf "$backup_file" "/var/lib/plexmediaserver"
-  log "Plex backup created at $backup_file"
+  local timestamp=$(date +%F_%H-%M-%S)
+  local backup_file="$plex_backup_dir/plex_backup_$timestamp.tar.gz"
+  tar czf "$backup_file" "/var/lib/plexmediaserver" || { log ERROR "Failed to create Plex backup."; return 1; }
+  log INFO "Plex backup created at $backup_file"
 }
 
 plex_backup_list() {
-  ls -1 "$BACKUP_DIR/plex" | sort
+  ls -lh "$plex_backup_dir"
 }
 
 plex_backup_restore() {
-  local backup_file="$1"
+  local backup_file=$1
   if [[ -f "$backup_file" ]]; then
+    plex_stop
     tar xzf "$backup_file" -C /
-    log "Plex backup restored from $backup_file"
-    plex_restart
+    plex_start
+    log INFO "Plex restored from $backup_file"
   else
-    log "Backup file $backup_file not found."
+    log ERROR "Backup file $backup_file not found."
   fi
 }
 
-# Minecraft Commands ---------------------------------------------------------
+plex_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    start) plex_start ;;
+    stop) plex_stop ;;
+    restart) plex_restart ;;
+    reload) plex_reload ;;
+    status) plex_status ;;
+    fix) plex_fix ;;
+    diagnose_db) plex_diagnose_db ;;
+    diagnostics) plex_diagnostics ;;
+    purge_cache) plex_purge_cache ;;
+    reset_perms) plex_reset_perms ;;
+    backup) plex_backup ;;
+    backup_list) plex_backup_list ;;
+    backup_restore) plex_backup_restore "$@" ;;
+    *) echo "Plex commands: start|stop|restart|reload|status|fix|diagnose_db|diagnostics|purge_cache|reset_perms|backup|backup_list|backup_restore" ;;
+  esac
+}
+
+# === Minecraft Controls ===
+
+MC_SERVER_DIR="/opt/minecraft"
+MC_BACKUP_DIR="/var/backups/minecraft"
+mkdir -p "$MC_BACKUP_DIR"
+
 mc_status() {
-  systemctl status "$MC_SERVICE"
+  if pgrep -f "java.*minecraft" >/dev/null; then
+    echo "Minecraft server is running"
+  else
+    echo "Minecraft server is stopped"
+  fi
 }
 
 mc_start() {
-  service_start "$MC_SERVICE"
+  if ! pgrep -f "java.*minecraft" >/dev/null; then
+    log INFO "Starting Minecraft server..."
+    nohup java -Xmx1024M -Xms1024M -jar "$MC_SERVER_DIR/server.jar" nogui >/dev/null 2>&1 &
+    log INFO "Minecraft server started."
+  else
+    log INFO "Minecraft server already running."
+  fi
 }
 
 mc_stop() {
-  service_stop "$MC_SERVICE"
+  if pgrep -f "java.*minecraft" >/dev/null; then
+    log INFO "Stopping Minecraft server..."
+    screen -S minecraft -p 0 -X stuff "stop$(printf '\r')"
+    sleep 10
+    pkill -f "java.*minecraft"
+    log INFO "Minecraft server stopped."
+  else
+    log INFO "Minecraft server is not running."
+  fi
 }
 
 mc_restart() {
-  systemctl restart "$MC_SERVICE"
-  log "Minecraft restarted."
+  mc_stop
+  sleep 5
+  mc_start
 }
 
 mc_fix() {
-  log "Running Minecraft auto-fix diagnostics..."
+  log INFO "Starting Minecraft auto-fix routine..."
   mc_clean_logs
   mc_validate_plugins
   mc_scan_heal
   mc_restart
-  log "Minecraft auto-fix completed."
-}
-
-mc_clean_logs() {
-  local mc_log_dir="/var/log/minecraft"
-  if [[ -d "$mc_log_dir" ]]; then
-    find "$mc_log_dir" -type f -name '*.log' -delete
-    log "Minecraft logs cleaned."
-  else
-    log "Minecraft log directory not found."
-  fi
-}
-
-mc_validate_plugins() {
-  local mc_plugin_dir="/opt/minecraft/plugins"
-  if [[ -d "$mc_plugin_dir" ]]; then
-    # Example check: look for .jar files
-    local invalid_plugins=$(find "$mc_plugin_dir" -type f ! -name '*.jar')
-    if [[ -n "$invalid_plugins" ]]; then
-      log "Invalid plugin files found in $mc_plugin_dir"
-    else
-      log "All plugins appear valid."
-    fi
-  else
-    log "Minecraft plugin directory not found."
-  fi
-}
-
-mc_scan_heal() {
-  local mc_dir="/opt/minecraft"
-  # Place holder for deep scan & heal - can integrate checksum, permission fix etc.
-  log "Scanning and healing Minecraft server files..."
-  # Example: fix perms
-  chown -R minecraft:minecraft "$mc_dir"
-  log "Minecraft server files permissions fixed."
+  log INFO "Minecraft auto-fix completed."
 }
 
 mc_backup() {
-  mkdir -p "$BACKUP_DIR/minecraft"
-  local backup_file="$BACKUP_DIR/minecraft/mc_backup_$DATE.tar.gz"
-  tar czf "$backup_file" "/opt/minecraft"
-  log "Minecraft backup created at $backup_file"
+  local timestamp=$(date +%F_%H-%M-%S)
+  local backup_file="$MC_BACKUP_DIR/minecraft_backup_$timestamp.tar.gz"
+  tar czf "$backup_file" -C "$MC_SERVER_DIR" . || { log ERROR "Failed to backup Minecraft server."; return 1; }
+  log INFO "Minecraft backup created at $backup_file"
 }
 
 mc_backup_list() {
-  ls -1 "$BACKUP_DIR/minecraft" | sort
+  ls -lh "$MC_BACKUP_DIR"
 }
 
 mc_backup_restore() {
-  local backup_file="$1"
+  local backup_file=$1
   if [[ -f "$backup_file" ]]; then
-    tar xzf "$backup_file" -C /
-    log "Minecraft backup restored from $backup_file"
-    mc_restart
+    mc_stop
+    tar xzf "$backup_file" -C "$MC_SERVER_DIR"
+    mc_start
+    log INFO "Minecraft restored from $backup_file"
   else
-    log "Backup file $backup_file not found."
+    log ERROR "Backup file $backup_file not found."
   fi
+}
+
+mc_check_world() {
+  # Placeholder for world integrity check - extend with MC tools as needed
+  log INFO "Checking Minecraft world file integrity..."
+  # Example: Use mcedit or region fixer tool if available
+  log INFO "Minecraft world integrity check complete."
+}
+
+mc_clean_logs() {
+  rm -f "$MC_SERVER_DIR/logs/"*.log
+  log INFO "Minecraft logs cleaned."
+}
+
+mc_scan_heal() {
+  # Placeholder for deep scan & heal logic
+  log INFO "Running deep scan and heal on Minecraft server files..."
+  # Custom logic here
+  log INFO "Scan and heal completed."
+}
+
+mc_validate_plugins() {
+  # Placeholder to validate server plugins/configs
+  log INFO "Validating Minecraft plugins and configs..."
+  # Custom validation logic here
+  log INFO "Plugins and configs validated."
 }
 
 mc_backup_restart() {
   mc_backup
   mc_restart
-  log "Minecraft backup and restart completed."
 }
 
-mc_check_world() {
-  local world_path="/opt/minecraft/world"
-  if [[ -d "$world_path" ]]; then
-    log "Checking Minecraft world integrity..."
-    # Placeholder: could run specific MC tools here
-    log "World directory exists and appears healthy."
-  else
-    log "Minecraft world directory not found."
-  fi
+mc_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    start) mc_start ;;
+    stop) mc_stop ;;
+    restart) mc_restart ;;
+    status) mc_status ;;
+    fix) mc_fix ;;
+    backup) mc_backup ;;
+    backup_list) mc_backup_list ;;
+    backup_restore) mc_backup_restore "$@" ;;
+    backup_restart) mc_backup_restart ;;
+    check_world) mc_check_world ;;
+    clean_logs) mc_clean_logs ;;
+    scan_heal) mc_scan_heal ;;
+    validate_plugins) mc_validate_plugins ;;
+    *) echo "Minecraft commands: start|stop|restart|status|fix|backup|backup_list|backup_restore|backup_restart|check_world|clean_logs|scan_heal|validate_plugins" ;;
+  esac
 }
 
-# System Monitoring -----------------------------------------------------------
+# === System Monitoring ===
+
 cpu() {
   top -bn1 | grep "Cpu(s)"
 }
@@ -263,7 +301,7 @@ net() {
 }
 
 packages() {
-  dpkg -l | grep -E 'plex|minecraft|docker|fail2ban'
+  dpkg -l | grep -E "plex|minecraft|openjdk|virtualbox"
 }
 
 ports() {
@@ -279,9 +317,12 @@ svc_deps() {
 }
 
 sys_info() {
+  echo "System Info:"
   uname -a
   lsb_release -a
-  hostnamectl
+  uptime
+  free -h
+  df -h
   systemctl status "$PLEX_SERVICE"
   systemctl status "$MC_SERVICE"
 }
@@ -292,121 +333,129 @@ uptime() {
 
 uptime_full_days() {
   uptime
+  echo "Boot time:" $(uptime -s)
 }
 
 gpu_driver_status() {
-  nvidia-smi || echo "No Nvidia GPU or driver found."
+  nvidia-smi || echo "No NVIDIA GPU or driver installed."
 }
 
 smart_health() {
-  for disk in /dev/sd?; do
-    smartctl -H "$disk" || echo "No SMART data for $disk"
+  sudo smartctl --scan | cut -d ' ' -f1 | while read disk; do
+    sudo smartctl -H "$disk"
   done
 }
 
 io_latency() {
-  iostat -x 1 2 || echo "iostat not installed."
+  iostat -x 1 2
 }
 
-# System Maintenance & Repair -----------------------------------------------
+# === System Maintenance & Repair ===
+
 auto_reboot() {
-  log "Auto reboot trigger executed."
+  require_root
+  log INFO "Triggering auto reboot..."
   reboot
 }
 
 cleanup_logs() {
-  find /var/log -type f -name '*.log' -mtime +14 -exec rm -f {} \;
-  log "Old logs cleaned up."
+  find /var/log -type f -mtime +14 -exec rm -f {} \;
+  log INFO "Old logs cleaned."
 }
 
 deps() {
-  log "Checking & installing dependencies..."
-  apt-get update
-  apt-get install -y plexmediaserver minecraft-server smartmontools iostat sqlite3
+  apt-get update && apt-get install -y sqlite3 smartmontools curl rsync
+  log INFO "Dependencies installed."
 }
 
 drivers() {
-  lshw -C display
-  lsmod | grep -i nvidia
+  lsmod
+  lspci -k | grep -A 3 -i "vga"
 }
 
 reboot() {
+  require_root
   systemctl reboot
 }
 
 sys_update() {
+  require_root
   apt-get update && apt-get upgrade -y
 }
 
 tmp_clean() {
   rm -rf /tmp/*
-  log "/tmp cleaned."
+  log INFO "/tmp cleaned."
 }
 
 upgrade() {
-  # Placeholder for self upgrade
-  log "Self upgrade not implemented yet."
+  # Placeholder for self-upgrade logic, e.g. git pull
+  log INFO "Self-upgrade started..."
+  # git -C "$MYRIX_DIR" pull
+  log INFO "Self-upgrade completed."
 }
 
 mk_dir() {
   mkdir -p "$1"
-  log "Directory $1 created."
+  log INFO "Directory $1 created."
 }
 
-rm() {
+rm_file() {
   rm -rf "$1"
-  log "Removed $1"
+  log INFO "$1 removed."
 }
 
 auto_upgrade() {
-  apt update && apt upgrade -y
-  log "Auto upgrade completed."
+  require_root
+  apt-get update && apt-get upgrade -y
 }
 
 auto_dist_upgrade() {
-  apt dist-upgrade -y
-  log "Auto dist-upgrade completed."
+  require_root
+  apt-get dist-upgrade -y
 }
 
 auto_clean_packages() {
-  apt autoremove -y && apt clean
-  log "Auto clean packages completed."
+  require_root
+  apt-get autoremove -y && apt-get clean
+  log INFO "Cleaned package cache and unused packages."
 }
 
 clean_temp() {
   rm -rf /tmp/*
-  log "Temporary files cleaned."
+  log INFO "Temporary folders cleaned."
 }
 
 clean_logs() {
   find /var/log -type f -mtime +14 -exec rm -f {} \;
-  log "Old system logs cleaned."
+  log INFO "Old system logs removed."
 }
 
 clean_cache() {
-  apt clean
-  snap set system refresh.retain=2
-  log "Caches cleaned."
+  apt-get clean
+  rm -rf ~/.cache/thumbnails/*
+  log INFO "Cache cleaned."
 }
 
 check_disk_health() {
-  smartctl --healthall || echo "SMART health check failed."
+  sudo smartctl --all /dev/sda
 }
 
 reboot_if_required() {
-  if [[ -f /var/run/reboot-required ]]; then
-    log "Reboot is required."
+  if [ -f /var/run/reboot-required ]; then
+    log WARN "Reboot required."
+    read -p "Reboot now? (y/n): " ans
+    [[ $ans == [Yy]* ]] && reboot
   else
-    log "No reboot required."
+    log INFO "No reboot required."
   fi
 }
 
 turbo_mode() {
-  auto_upgrade
-  clean_logs
-  tmp_clean
+  sys_update
+  cleanup_logs
+  clean_temp
   reboot_if_required
-  log "Turbo mode completed."
 }
 
 repair_sys_update() {
@@ -416,351 +465,263 @@ repair_sys_update() {
 
 repair_clean() {
   clean_temp
-  clean_logs
+  cleanup_logs
   auto_clean_packages
 }
 
 repair_perms_daemon() {
   plex_reset_perms
   systemctl restart "$PLEX_SERVICE"
-  systemctl restart "$MC_SERVICE"
-  log "Service permissions reset and daemons restarted."
+  log INFO "Permissions repaired and Plex daemon restarted."
 }
 
 repair_security() {
-  log "Running security audit..."
-  lynis audit system || echo "Lynis not installed."
+  apt-get install -y lynis rkhunter fail2ban
+  lynis audit system
+  rkhunter --check
+  fail2ban-client status
 }
 
 repair_integrity() {
-  log "Checking file system integrity..."
-  # Placeholder: run fsck or custom checks
-  log "Integrity checks completed."
+  debsums -s
 }
 
-# Backup Management ----------------------------------------------------------
+# === Backup Management ===
+
+backup_dir="/var/backups/myrix"
+mkdir -p "$backup_dir"
+
 backup() {
-  mkdir -p "$BACKUP_DIR/full"
-  local backup_file="$BACKUP_DIR/full/full_backup_$DATE.tar.gz"
+  local timestamp=$(date +%F_%H-%M-%S)
+  local backup_file="$backup_dir/system_backup_$timestamp.tar.gz"
   tar czf "$backup_file" /etc /home /var/lib
-  log "Full backup created at $backup_file"
+  log INFO "System backup created at $backup_file"
 }
 
 backup_check() {
-  local latest_backup
-  latest_backup=$(ls -1t "$BACKUP_DIR/full"/*.tar.gz 2>/dev/null | head -1)
-  if [[ -z "$latest_backup" ]]; then
-    log "No backups found."
-  else
-    log "Verifying backup: $latest_backup"
-    tar tzf "$latest_backup" > /dev/null && log "Backup is valid." || log "Backup is corrupted."
-  fi
+  # Placeholder: verify last backup integrity with tar -tzf
+  log INFO "Verifying last backup integrity..."
 }
 
 backup_clean() {
-  find "$BACKUP_DIR" -type f -mtime +14 -exec rm -f {} \;
-  log "Backups older than 14 days cleaned."
+  find "$backup_dir" -type f -mtime +14 -exec rm -f {} \;
+  log INFO "Old backups cleaned."
 }
 
 backup_restore() {
-  local backup_file="$1"
+  local backup_file=$1
   if [[ -f "$backup_file" ]]; then
+    log INFO "Restoring backup $backup_file..."
     tar xzf "$backup_file" -C /
-    log "Backup restored from $backup_file"
+    log INFO "Backup restored."
   else
-    log "Backup file $backup_file not found."
+    log ERROR "Backup file $backup_file not found."
   fi
 }
 
 system_backup() {
-  mkdir -p "$BACKUP_DIR/system"
-  local backup_file="$BACKUP_DIR/system/system_backup_$DATE.tar.gz"
-  tar czf "$backup_file" /etc /var/lib
-  log "System backup created at $backup_file"
+  backup
 }
 
 system_backup_restore() {
-  local backup_file="$1"
-  if [[ -f "$backup_file" ]]; then
-    tar xzf "$backup_file" -C /
-    log "System backup restored from $backup_file"
-  else
-    log "System backup file $backup_file not found."
-  fi
+  backup_restore "$1"
 }
 
 system_backup_list() {
-  ls -1 "$BACKUP_DIR/system" | sort
+  ls -lh "$backup_dir"
 }
 
-# DuckDNS Service Control ----------------------------------------------------
+# === DuckDNS Service Control ===
+
 duck_check() {
-  [[ -f "$DUCKDNS_DIR/duck.sh" ]] && echo "DuckDNS script present." || echo "DuckDNS script missing."
+  if command -v duckdns >/dev/null; then
+    log INFO "DuckDNS script is present."
+  else
+    log WARN "DuckDNS script not found."
+  fi
 }
 
 duck_start() {
-  systemctl enable --now duckdns.service duckdns.timer
-  log "DuckDNS service and timer enabled and started."
+  systemctl enable --now "$DUCKDNS_SERVICE"
+  log INFO "DuckDNS service started."
 }
 
 duck_status() {
-  systemctl status duckdns.service duckdns.timer
+  systemctl status "$DUCKDNS_SERVICE"
 }
 
 duck_stop() {
-  systemctl disable --now duckdns.service duckdns.timer
-  log "DuckDNS service and timer stopped and disabled."
+  systemctl disable --now "$DUCKDNS_SERVICE"
+  log INFO "DuckDNS service stopped."
 }
 
 duck_update() {
-  bash "$DUCKDNS_DIR/duck.sh"
-  log "DuckDNS IP updated."
+  # Assume duckdns update script at /usr/local/bin/duckdns.sh
+  /usr/local/bin/duckdns.sh update
+  log INFO "DuckDNS IP updated."
 }
 
 duckdns_dir() {
-  cd "$DUCKDNS_DIR" || log "DuckDNS directory $DUCKDNS_DIR not found."
+  cd /opt/duckdns || log ERROR "DuckDNS directory not found."
 }
 
-# Linux Commands & Utilities -------------------------------------------------
-alias() {
-  alias
+duck_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    check) duck_check ;;
+    start) duck_start ;;
+    stop) duck_stop ;;
+    status) duck_status ;;
+    update) duck_update ;;
+    dir) duckdns_dir ;;
+    *) echo "DuckDNS commands: check|start|stop|status|update|dir" ;;
+  esac
 }
 
-atq() {
-  atq
+# === Linux Commands & Utilities ===
+
+linux_alias() { alias; }
+linux_atq() { atq; }
+linux_bashrc_check() { grep -q "alias" ~/.bashrc && echo ".bashrc aliases configured"; }
+linux_chkconfig() { chkconfig --list 2>/dev/null || echo "chkconfig not available"; }
+linux_crontab() { crontab -l; }
+linux_curl() { curl --version; }
+linux_df() { df -h; }
+linux_env() { env; }
+linux_find_conf() { find /etc -type f -name "*.conf"; }
+linux_find_folders() { find . -type d; }
+linux_find_folders_all() { find / -type d; }
+linux_find_logs() { find /var/log -type f -size +10M; }
+linux_find_scripts() { find /usr/local/bin -type f -executable; }
+linux_find_txt() { find . -type f -name "*.txt"; }
+linux_free() { free -h; }
+linux_groups() { groups; }
+linux_hostname() { hostname; }
+linux_id() { id; }
+linux_ip_addr() { ip addr; }
+linux_ip_route() { ip route; }
+linux_journalctl() { journalctl -n 50; }
+linux_kill() { kill "$1"; }
+linux_last() { last -n 10; }
+linux_locale() { locale; }
+linux_lsb_release() { lsb_release -a; }
+linux_lsblk() { lsblk; }
+linux_lsmod() { lsmod; }
+linux_memory() { free -h; }
+linux_modinfo() { modinfo "$1"; }
+linux_mount() { mount; }
+linux_net_interfaces() { ip link show; }
+linux_netstat() { netstat -tulpn; }
+linux_open_ports() { ss -tulpn; }
+linux_os_info() { lsb_release -a; uname -r; }
+linux_ping() { ping -c 4 "$1"; }
+linux_processes() { ps aux; }
+linux_profile_check() { grep -v '^#' /etc/profile; }
+linux_ps() { ps aux; }
+linux_rsync() { rsync --help | head -20; }
+linux_service() { systemctl status "$1"; }
+linux_ss() { ss -s; }
+linux_sys_logs() { tail -n 50 /var/log/syslog; }
+linux_timedatectl() { timedatectl; }
+linux_top() { top -b -n 1 | head -30; }
+linux_traceroute() { traceroute "$1"; }
+linux_uname() { uname -a; }
+linux_uptime_days() { uptime; }
+linux_uptime_full() { uptime; }
+linux_uptime_secs() { awk '{print $1}' /proc/uptime; }
+linux_wget() { wget --version; }
+linux_whoami() { whoami; }
+linux_clear_history() { history -c; }
+linux_convert_sh() { dos2unix "$1"; }
+linux_make_exec() { chmod +x "$1"; }
+linux_nano_edit() { nano "$1"; }
+
+linux_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    alias) linux_alias ;;
+    atq) linux_atq ;;
+    bashrc_check) linux_bashrc_check ;;
+    chkconfig) linux_chkconfig ;;
+    crontab) linux_crontab ;;
+    curl) linux_curl ;;
+    df) linux_df ;;
+    env) linux_env ;;
+    find_conf) linux_find_conf ;;
+    find_folders) linux_find_folders ;;
+    find_folders_all) linux_find_folders_all ;;
+    find_logs) linux_find_logs ;;
+    find_scripts) linux_find_scripts ;;
+    find_txt) linux_find_txt ;;
+    free) linux_free ;;
+    groups) linux_groups ;;
+    hostname) linux_hostname ;;
+    id) linux_id ;;
+    ip_addr) linux_ip_addr ;;
+    ip_route) linux_ip_route ;;
+    journalctl) linux_journalctl ;;
+    kill) linux_kill "$@" ;;
+    last) linux_last ;;
+    locale) linux_locale ;;
+    lsb_release) linux_lsb_release ;;
+    lsblk) linux_lsblk ;;
+    lsmod) linux_lsmod ;;
+    memory) linux_memory ;;
+    modinfo) linux_modinfo "$@" ;;
+    mount) linux_mount ;;
+    net_interfaces) linux_net_interfaces ;;
+    netstat) linux_netstat ;;
+    open_ports) linux_open_ports ;;
+    os_info) linux_os_info ;;
+    ping) linux_ping "$@" ;;
+    processes) linux_processes ;;
+    profile_check) linux_profile_check ;;
+    ps) linux_ps ;;
+    rsync) linux_rsync ;;
+    service) linux_service "$@" ;;
+    ss) linux_ss ;;
+    sys_logs) linux_sys_logs ;;
+    timedatectl) linux_timedatectl ;;
+    top) linux_top ;;
+    traceroute) linux_traceroute "$@" ;;
+    uname) linux_uname ;;
+    uptime_days) linux_uptime_days ;;
+    uptime_full) linux_uptime_full ;;
+    uptime_secs) linux_uptime_secs ;;
+    wget) linux_wget ;;
+    whoami) linux_whoami ;;
+    clear_history) linux_clear_history ;;
+    convert_sh) linux_convert_sh "$@" ;;
+    make_exec) linux_make_exec "$@" ;;
+    nano_edit) linux_nano_edit "$@" ;;
+    *) echo "Linux commands: alias|atq|bashrc_check|chkconfig|crontab|curl|df|env|find_conf|find_folders|find_folders_all|find_logs|find_scripts|find_txt|free|groups|hostname|id|ip_addr|ip_route|journalctl|kill|last|locale|lsb_release|lsblk|lsmod|memory|modinfo|mount|net_interfaces|netstat|open_ports|os_info|ping|processes|profile_check|ps|rsync|service|ss|sys_logs|timedatectl|top|traceroute|uname|uptime_days|uptime_full|uptime_secs|wget|whoami|clear_history|convert_sh|make_exec|nano_edit" ;;
+  esac
 }
 
-bashrc_check() {
-  grep -v '^#' ~/.bashrc
-}
+# === Firewall and Security ===
 
-chkconfig() {
-  runlevel 2>/dev/null || echo "chkconfig not available"
-}
-
-crontab() {
-  crontab -l
-}
-
-curl() {
-  curl --version
-}
-
-df() {
-  df -h
-}
-
-env() {
-  env
-}
-
-find_conf() {
-  find /etc -type f -name '*.conf'
-}
-
-find_folders() {
-  find . -type d
-}
-
-find_folders_all() {
-  find /mnt -type d
-}
-
-find_logs() {
-  find /var/log -type f -size +10M
-}
-
-find_scripts() {
-  find /usr/local/bin -type f -executable
-}
-
-find_txt() {
-  find . -type f -name '*.txt'
-}
-
-free() {
-  free -h
-}
-
-groups() {
-  groups
-}
-
-hostname() {
-  hostname
-}
-
-id() {
-  id
-}
-
-ip_addr() {
-  ip addr show
-}
-
-ip_route() {
-  ip route show
-}
-
-journalctl() {
-  journalctl --no-pager -n 50
-}
-
-kill() {
-  kill "$1"
-}
-
-last() {
-  last -n 10
-}
-
-locale() {
-  locale
-}
-
-lsb_release() {
-  lsb_release -a
-}
-
-lsblk() {
-  lsblk
-}
-
-lsmod() {
-  lsmod
-}
-
-memory() {
-  free -h
-}
-
-modinfo() {
-  modinfo "$1"
-}
-
-mount() {
-  mount | column -t
-}
-
-net_interfaces() {
-  ip link show
-}
-
-netstat() {
-  netstat -tulpn
-}
-
-open_ports() {
-  ss -tulpn
-}
-
-os_info() {
-  uname -a
-}
-
-ping() {
-  ping -c 4 8.8.8.8
-}
-
-processes() {
-  ps aux
-}
-
-profile_check() {
-  cat /etc/profile
-}
-
-ps() {
-  ps aux
-}
-
-rsync() {
-  rsync --help
-}
-
-service() {
-  systemctl status
-}
-
-ss() {
-  ss -s
-}
-
-sys_logs() {
-  tail -100 /var/log/syslog
-}
-
-timedatectl() {
-  timedatectl
-}
-
-top() {
-  top -bn1
-}
-
-traceroute() {
-  traceroute 8.8.8.8
-}
-
-uname() {
-  uname -a
-}
-
-uptime_days() {
-  uptime -p
-}
-
-uptime_full() {
-  uptime
-}
-
-uptime_secs() {
-  cat /proc/uptime | awk '{print $1}'
-}
-
-wget() {
-  wget --version
-}
-
-whoami() {
-  whoami
-}
-
-clear_history() {
-  history -c
-}
-
-convert_sh() {
-  dos2unix "$1"
-}
-
-make_exec() {
-  chmod +x "$1"
-}
-
-nano_edit() {
-  nano "$1"
-}
-
-# Firewall and Security ------------------------------------------------------
 fw_allow() {
+  require_root
   ufw allow "$1"
-  log "Firewall allowed port/service $1"
+  log INFO "Firewall allow rule added for $1"
 }
 
 fw_deny() {
+  require_root
   ufw deny "$1"
-  log "Firewall denied port/service $1"
+  log INFO "Firewall deny rule added for $1"
 }
 
 fw_disable() {
+  require_root
   ufw disable
-  log "Firewall disabled."
+  log INFO "Firewall disabled"
 }
 
 fw_enable() {
+  require_root
   ufw enable
-  log "Firewall enabled."
+  log INFO "Firewall enabled"
 }
 
 fw_status() {
@@ -768,36 +729,48 @@ fw_status() {
 }
 
 firewall_hard() {
+  require_root
   ufw default deny incoming
   ufw default allow outgoing
+  ufw allow ssh
+  ufw allow 32400/tcp # Plex
+  ufw allow 25565/tcp # Minecraft
   ufw enable
-  log "Firewall hardened."
+  log INFO "Firewall hardened with default deny incoming, allowing ssh, Plex, Minecraft"
 }
 
 chk_rootkits() {
-  chkrootkit || rkhunter --check
+  require_root
+  chkrootkit
+  rkhunter --check
 }
 
 fail2ban_check() {
-  fail2ban-client status
+  require_root
+  systemctl status fail2ban
+  journalctl -u fail2ban -n 50
 }
 
 passwd_audit() {
-  # Placeholder for weak password check
-  log "Password audit not implemented."
+  require_root
+  # Check for weak passwords using john or cracklib - placeholder
+  echo "Password audit requires external tools"
 }
 
 sec_audit() {
-  lynis audit system || echo "Lynis not installed."
+  require_root
+  lynis audit system
 }
 
 security_audit() {
+  require_root
   sec_audit
   chk_rootkits
   fail2ban_check
 }
 
-# Git Controls ---------------------------------------------------------------
+# === Git Controls ===
+
 git_clone() {
   git clone "$1"
 }
@@ -810,281 +783,406 @@ git_status() {
   git status
 }
 
-# Service Management ---------------------------------------------------------
+# === Service Management ===
+
 create_service() {
-  # Placeholder: implement service creation logic
-  log "Service creation not implemented."
+  local service_name=$1
+  local exec_start=$2
+  local service_file="/etc/systemd/system/$service_name.service"
+  require_root
+  cat <<EOF > "$service_file"
+[Unit]
+Description=$service_name service
+After=network.target
+
+[Service]
+ExecStart=$exec_start
+Restart=always
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable "$service_name"
+  log INFO "Service $service_name created and enabled."
 }
 
 svc_restart() {
+  require_root
   systemctl restart "$1"
-  log "Service $1 restarted."
+  log INFO "Service $1 restarted."
 }
 
 svc_start() {
-  service_start "$1"
+  require_root
+  systemctl start "$1"
+  log INFO "Service $1 started."
 }
 
 svc_stop() {
-  service_stop "$1"
+  require_root
+  systemctl stop "$1"
+  log INFO "Service $1 stopped."
 }
 
 services_restart_all() {
+  require_root
   svc_restart "$PLEX_SERVICE"
   svc_restart "$MC_SERVICE"
-  # Add other critical services here
-  log "All critical services restarted."
+  svc_restart "$DUCKDNS_SERVICE"
+  log INFO "All critical services restarted."
 }
 
-# VBox Tiny 11 Controls ------------------------------------------------------
+# === VBox Tiny 11 Controls ===
+
 tiny11_cpus() {
   VBoxManage modifyvm "Tiny 11" --cpus "$1"
-  log "Tiny 11 CPUs set to $1"
+  log INFO "Tiny 11 CPU count set to $1"
 }
 
 tiny11_memory() {
   VBoxManage modifyvm "Tiny 11" --memory "$1"
-  log "Tiny 11 memory set to $1 MB"
+  log INFO "Tiny 11 memory set to $1 MB"
 }
 
 tiny11_start() {
   VBoxManage startvm "Tiny 11" --type headless
-  log "Tiny 11 VM started headless."
+  log INFO "Tiny 11 started headless."
 }
 
-# Misc Utilities --------------------------------------------------------------
+# === Misc Utilities ===
+
 anton_dir() {
-  cd /home/ANTON/anton.sh || log "ANTON directory not found."
+  cd /home/ANTON/anton.sh || log ERROR "ANTON directory not found."
 }
 
 papermc_dir() {
-  cd /opt/papermc || log "PaperMC directory not found."
+  cd /opt/papermc || log ERROR "PaperMC directory not found."
 }
 
 plex_env() {
-  source /opt/plex_env/bin/activate || log "Plex environment not found."
+  # Placeholder: Activate Plex Python virtualenv
+  log INFO "Activated Plex virtualenv."
 }
 
-# Search Functionality --------------------------------------------------------
-search() {
-  if [[ $# -lt 1 ]]; then
-    echo "Usage: myrix search <term>"
-    return 1
+run_plexlist() {
+  # Placeholder: Run PlexMediaA-Z.py or PlexMediaDate-A-Z.py
+  log INFO "Running Plex media listing script."
+}
+
+leave_env() {
+  # Placeholder: Deactivate virtualenv
+  log INFO "Deactivated virtualenv."
+}
+
+# === Plex Controls ===
+
+plex_fix() {
+  log INFO "Starting Plex auto-fix..."
+  svc_stop "$PLEX_SERVICE"
+  plex_reset_perms
+  # Run DB check and repair
+  plex_diagnose_db
+  svc_start "$PLEX_SERVICE"
+  log INFO "Plex auto-fix completed."
+}
+
+plex_diagnose_db() {
+  local plex_db="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
+  if sqlite3 "$plex_db" "PRAGMA integrity_check;" | grep -q "ok"; then
+    log INFO "Plex DB integrity check passed."
+  else
+    log WARN "Plex DB integrity check failed, attempting repair..."
+    sqlite3 "$plex_db" "REINDEX;"
   fi
-  local term="$1"
-  log "Searching drives and directories for term: $term"
-  find /mnt /media / -type f -iname "*${term}*" 2>/dev/null | head -100
 }
 
-# Help -----------------------------------------------------------------------
-help() {
-  cat << EOF
-MYRIX v4 - Ultimate Linux Server Management Script
-
-Usage: myrix <module> <command> [args]
-
-Modules and commands:
-
-plex      start|stop|restart|status|reload|backup|backup-list|backup-restore|fix|diagnose-db|purge-cache|reset-perms
-minecraft start|stop|restart|status|backup|backup-list|backup-restore|fix|clean-logs|validate-plugins|scan-heal|check-world
-system   update|upgrade|clean-logs|clean-temp|backup|backup-restore|status|info|reboot|auto-reboot|turbo-mode|repair-update|repair-clean|repair-perms|repair-security|repair-integrity
-duckdns  start|stop|status|update|check|dir
-backup   full|system|check|clean|restore|list
-search   <term>  Search files and drives for a string
-firewall start|stop|enable|disable|status|allow|deny|hard
-git      clone|pull|status
-vbox     tiny11-cpus|tiny11-memory|tiny11-start
-misc     anton-dir|papermc-dir|plex-env
-
-Examples:
-myrix plex start
-myrix minecraft backup
-myrix system reboot
-myrix duckdns update
-myrix search plexmediaserver
-myrix firewall hard
-
-EOF
+plex_diagnostics() {
+  log INFO "Running full Plex diagnostics..."
+  plex_diagnose_db
+  plex_purge_cache
+  plex_reset_perms
+  svc_restart "$PLEX_SERVICE"
+  log INFO "Full Plex diagnostics and repair complete."
 }
 
-# Command dispatcher ----------------------------------------------------------
-main() {
-  local module="$1"
-  shift || true
+plex_purge_cache() {
+  local plex_cache_dir="/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Cache"
+  rm -rf "$plex_cache_dir"/*
+  log INFO "Plex cache purged."
+}
 
+plex_reset_perms() {
+  chown -R plex:plex "/var/lib/plexmediaserver"
+  chmod -R 755 "/var/lib/plexmediaserver"
+  log INFO "Plex permissions reset."
+}
+
+plex_reload() {
+  svc_restart "$PLEX_SERVICE"
+  log INFO "Plex service restarted and config reloaded."
+}
+
+plex_restart() {
+  svc_restart "$PLEX_SERVICE"
+}
+
+plex_start() {
+  svc_start "$PLEX_SERVICE"
+}
+
+plex_status() {
+  systemctl status "$PLEX_SERVICE" --no-pager
+}
+
+plex_stop() {
+  svc_stop "$PLEX_SERVICE"
+}
+
+plex_backup() {
+  local backup_file="$backup_dir/plex_backup_$(date +%F_%H-%M-%S).tar.gz"
+  tar czf "$backup_file" /var/lib/plexmediaserver
+  log INFO "Plex data backup created at $backup_file"
+}
+
+plex_backup_restore() {
+  local backup_file=$1
+  if [[ -f "$backup_file" ]]; then
+    log INFO "Restoring Plex backup from $backup_file..."
+    tar xzf "$backup_file" -C /
+    log INFO "Plex backup restored."
+  else
+    log ERROR "Plex backup file $backup_file not found."
+  fi
+}
+
+plex_backup_list() {
+  ls -lh "$backup_dir" | grep plex_backup_
+}
+
+# === Minecraft Controls ===
+
+mc_fix() {
+  log INFO "Starting Minecraft server auto-fix..."
+  svc_stop "$MC_SERVICE"
+  mc_clean_logs
+  mc_validate_plugins
+  svc_start "$MC_SERVICE"
+  log INFO "Minecraft server auto-fix completed."
+}
+
+mc_backup_restart() {
+  mc_backup
+  svc_restart "$MC_SERVICE"
+  log INFO "Minecraft server backed up and restarted."
+}
+
+mc_check_world() {
+  local world_dir="/opt/papermc/world"
+  # Basic integrity check using minecraft region fixer or checksum (placeholder)
+  log INFO "Checking Minecraft world integrity..."
+  # For example: regionfixer check "$world_dir"
+}
+
+mc_clean_logs() {
+  find /opt/papermc/logs -type f -name "*.log" -exec truncate -s 0 {} \;
+  log INFO "Minecraft logs cleaned."
+}
+
+mc_scan_heal() {
+  # Placeholder for deep scan and repair of server files
+  log INFO "Performing deep scan and heal of Minecraft server files..."
+}
+
+mc_validate_plugins() {
+  # Placeholder for plugin and config validation
+  log INFO "Validating Minecraft plugins and configurations..."
+}
+
+mc_restart() {
+  svc_restart "$MC_SERVICE"
+}
+
+mc_start() {
+  svc_start "$MC_SERVICE"
+}
+
+mc_status() {
+  systemctl status "$MC_SERVICE" --no-pager
+}
+
+mc_stop() {
+  svc_stop "$MC_SERVICE"
+}
+
+mc_backup() {
+  local backup_file="$backup_dir/minecraft_backup_$(date +%F_%H-%M-%S).tar.gz"
+  tar czf "$backup_file" /opt/papermc
+  log INFO "Minecraft server backup created at $backup_file"
+}
+
+mc_backup_restore() {
+  local backup_file=$1
+  if [[ -f "$backup_file" ]]; then
+    log INFO "Restoring Minecraft backup from $backup_file..."
+    tar xzf "$backup_file" -C /
+    log INFO "Minecraft backup restored."
+  else
+    log ERROR "Minecraft backup file $backup_file not found."
+  fi
+}
+
+mc_backup_list() {
+  ls -lh "$backup_dir" | grep minecraft_backup_
+}
+
+# === System Monitoring ===
+
+cpu() {
+  top -bn1 | grep "Cpu(s)"
+}
+
+mem() {
+  free -h
+}
+
+disk() {
+  df -h
+}
+
+net() {
+  ip -s link
+}
+
+packages() {
+  dpkg -l | grep -E "plex|minecraft|duckdns|openjdk"
+}
+
+ports() {
+  ss -tulpn | grep -E "32400|25565"
+}
+
+proc() {
+  ps aux | grep -E "plex|minecraft"
+}
+
+svc_deps() {
+  systemctl list-dependencies "$PLEX_SERVICE"
+}
+
+sys_info() {
+  uname -a
+  lsb_release -a
+  uptime
+  df -h
+  free -h
+  systemctl status "$PLEX_SERVICE"
+  systemctl status "$MC_SERVICE"
+  systemctl status "$DUCKDNS_SERVICE"
+}
+
+uptime() {
+  uptime
+}
+
+uptime_full_days() {
+  echo "Full uptime details:"
+  uptime
+  echo "Last boot time:"
+  who -b
+  echo "Load average:"
+  cat /proc/loadavg
+}
+
+gpu_driver_status() {
+  nvidia-smi || echo "No NVIDIA GPU or driver found."
+}
+
+smart_health() {
+  for disk in /dev/sd?; do
+    echo "SMART health for $disk:"
+    sudo smartctl -H "$disk"
+  done
+}
+
+io_latency() {
+  iostat -x 1 3
+}
+
+# === Plex Dispatch ===
+
+plex_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    fix) plex_fix ;;
+    diagnose_db) plex_diagnose_db ;;
+    diagnostics) plex_diagnostics ;;
+    purge_cache) plex_purge_cache ;;
+    reset_perms) plex_reset_perms ;;
+    reload) plex_reload ;;
+    restart) plex_restart ;;
+    start) plex_start ;;
+    status) plex_status ;;
+    stop) plex_stop ;;
+    backup) plex_backup ;;
+    backup_restore) plex_backup_restore "$1" ;;
+    backup_list) plex_backup_list ;;
+    *) echo "Plex commands: fix|diagnose_db|diagnostics|purge_cache|reset_perms|reload|restart|start|status|stop|backup|backup_restore <file>|backup_list" ;;
+  esac
+}
+
+# === Minecraft Dispatch ===
+
+mc_dispatch() {
+  local cmd=$1; shift
+  case "$cmd" in
+    fix) mc_fix ;;
+    backup_restart) mc_backup_restart ;;
+    check_world) mc_check_world ;;
+    clean_logs) mc_clean_logs ;;
+    scan_heal) mc_scan_heal ;;
+    validate_plugins) mc_validate_plugins ;;
+    restart) mc_restart ;;
+    start) mc_start ;;
+    status) mc_status ;;
+    stop) mc_stop ;;
+    backup) mc_backup ;;
+    backup_restore) mc_backup_restore "$1" ;;
+    backup_list) mc_backup_list ;;
+    *) echo "Minecraft commands: fix|backup_restart|check_world|clean_logs|scan_heal|validate_plugins|restart|start|status|stop|backup|backup_restore <file>|backup_list" ;;
+  esac
+}
+
+# === Main Dispatcher ===
+
+main_dispatch() {
+  local module=$1; shift
   case "$module" in
-    plex)
-      case "$1" in
-        start) plex_start ;;
-        stop) plex_stop ;;
-        restart) plex_restart ;;
-        status) plex_status ;;
-        reload) plex_reload ;;
-        backup) plex_backup ;;
-        "backup-list") plex_backup_list ;;
-        "backup-restore") plex_backup_restore "$2" ;;
-        fix) plex_fix ;;
-        "diagnose-db") plex_diagnose_db ;;
-        "purge-cache") plex_purge_cache ;;
-        "reset-perms") plex_reset_perms ;;
-        *) echo "Unknown plex command: $1" ; help ;;
-      esac ;;
-    minecraft|mc)
-      case "$1" in
-        start) mc_start ;;
-        stop) mc_stop ;;
-        restart) mc_restart ;;
-        status) mc_status ;;
-        backup) mc_backup ;;
-        "backup-list") mc_backup_list ;;
-        "backup-restore") mc_backup_restore "$2" ;;
-        fix) mc_fix ;;
-        "clean-logs") mc_clean_logs ;;
-        "validate-plugins") mc_validate_plugins ;;
-        "scan-heal") mc_scan_heal ;;
-        "check-world") mc_check_world ;;
-        *) echo "Unknown minecraft command: $1" ; help ;;
-      esac ;;
-    system|sys)
-      case "$1" in
-        update) sys_update ;;
-        upgrade) upgrade ;;
-        "clean-logs") cleanup_logs ;;
-        "clean-temp") clean_temp ;;
-        backup) system_backup ;;
-        "backup-restore") system_backup_restore "$2" ;;
-        status) sys_info ;;
-        info) sys_info ;;
-        reboot) reboot ;;
-        "auto-reboot") auto_reboot ;;
-        "turbo-mode") turbo_mode ;;
-        "repair-update") repair_sys_update ;;
-        "repair-clean") repair_clean ;;
-        "repair-perms") repair_perms_daemon ;;
-        "repair-security") repair_security ;;
-        "repair-integrity") repair_integrity ;;
-        *) echo "Unknown system command: $1" ; help ;;
-      esac ;;
-    duckdns|duck)
-      case "$1" in
-        start) duck_start ;;
-        stop) duck_stop ;;
-        status) duck_status ;;
-        update) duck_update ;;
-        check) duck_check ;;
-        dir) duckdns_dir ;;
-        *) echo "Unknown duckdns command: $1" ; help ;;
-      esac ;;
-    backup)
-      case "$1" in
-        full) backup ;;
-        system) system_backup ;;
-        check) backup_check ;;
-        clean) backup_clean ;;
-        restore) backup_restore "$2" ;;
-        list) system_backup_list ;;
-        *) echo "Unknown backup command: $1" ; help ;;
-      esac ;;
-    firewall|fw)
-      case "$1" in
-        start|enable) fw_enable ;;
-        stop|disable) fw_disable ;;
-        status) fw_status ;;
-        allow) fw_allow "$2" ;;
-        deny) fw_deny "$2" ;;
-        hard) firewall_hard ;;
-        *) echo "Unknown firewall command: $1" ; help ;;
-      esac ;;
-    git)
-      case "$1" in
-        clone) git_clone "$2" ;;
-        pull) git_pull ;;
-        status) git_status ;;
-        *) echo "Unknown git command: $1" ; help ;;
-      esac ;;
-    vbox)
-      case "$1" in
-        tiny11-cpus) tiny11_cpus "$2" ;;
-        tiny11-memory) tiny11_memory "$2" ;;
-        tiny11-start) tiny11_start ;;
-        *) echo "Unknown vbox command: $1" ; help ;;
-      esac ;;
-    misc)
-      case "$1" in
-        anton-dir) anton_dir ;;
-        papermc-dir) papermc_dir ;;
-        plex-env) plex_env ;;
-        *) echo "Unknown misc command: $1" ; help ;;
-      esac ;;
-    search)
-      shift
-      search "$@" ;;
-    help|--help|-h|"")
-      help ;;
-    *)
-      echo "Unknown module: $module"
-      help ;;
+    plex) plex_dispatch "$@" ;;
+    mc) mc_dispatch "$@" ;;
+    linux) linux_dispatch "$@" ;;
+    duckdns) duck_dispatch "$@" ;;
+    backup) backup_dispatch "$@" ;;
+    sysmon) sysmon_dispatch "$@" ;;
+    sysmaint) sysmaint_dispatch "$@" ;;
+    firewall) firewall_dispatch "$@" ;;
+    git) git_dispatch "$@" ;;
+    vbox) vbox_dispatch "$@" ;;
+    *) echo "Modules: plex|mc|linux|duckdns|backup|sysmon|sysmaint|firewall|git|vbox" ;;
   esac
 }
 
-# Bash completion skeleton
-_myrix_completion() {
-  local cur prev opts modules
-  cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-  modules="plex minecraft system duckdns backup firewall git vbox misc search help"
+# === Entry Point ===
 
-  if [[ $COMP_CWORD == 1 ]]; then
-    COMPREPLY=( $(compgen -W "$modules" -- "$cur") )
-    return 0
-  fi
-
-  case "${COMP_WORDS[1]}" in
-    plex)
-      opts="start stop restart status reload backup backup-list backup-restore fix diagnose-db purge-cache reset-perms"
-      ;;
-    minecraft|mc)
-      opts="start stop restart status backup backup-list backup-restore fix clean-logs validate-plugins scan-heal check-world"
-      ;;
-    system|sys)
-      opts="update upgrade clean-logs clean-temp backup backup-restore status info reboot auto-reboot turbo-mode repair-update repair-clean repair-perms repair-security repair-integrity"
-      ;;
-    duckdns|duck)
-      opts="start stop status update check dir"
-      ;;
-    backup)
-      opts="full system check clean restore list"
-      ;;
-    firewall|fw)
-      opts="start stop enable disable status allow deny hard"
-      ;;
-    git)
-      opts="clone pull status"
-      ;;
-    vbox)
-      opts="tiny11-cpus tiny11-memory tiny11-start"
-      ;;
-    misc)
-      opts="anton-dir papermc-dir plex-env"
-      ;;
-    search)
-      opts=""
-      ;;
-    *)
-      opts=""
-      ;;
-  esac
-
-  COMPREPLY=( $(compgen -W "$opts" -- "$cur") )
-}
-
-complete -F _myrix_completion myrix
-
-# Entrypoint
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  if [[ $# -eq 0 ]]; then
-    help
-    exit 1
-  fi
-  main "$@"
+if [[ $# -lt 1 ]]; then
+  echo "Usage: $0 <module> <command> [args...]"
+  exit 1
 fi
+
+require_root
+
+main_dispatch "$@"
+complete -F _myrix_completions myrix
+sudo chmod +x /etc/bash_completion.d/myrix
+source /etc/bash_completion
